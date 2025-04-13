@@ -26,18 +26,23 @@ df = pd.read_csv("processed_data.csv")
 # === 2. Определяем нужные столбцы ===
 columns_to_analyze = ["TP2", "TP3", "H1", "DV_pressure", "Reservoirs", "Oil_temperature", "Motor_current"]
 df_numeric = df[columns_to_analyze]
+
+
 # === 3. Kurtosis Measure (Эксцесс) ===
 def detect_outliers_kurtosis(df, threshold=3):
     kurt_values = df.apply(kurtosis)
     return kurt_values[abs(kurt_values) > threshold]
 
+
 outliers_kurtosis = detect_outliers_kurtosis(df_numeric)
 print("\n🔹 Выбросы по Kurtosis:\n", outliers_kurtosis)
+
 
 # === 4. Z-score (Отклонение от среднего) ===
 def detect_outliers_zscore(df, threshold=3):
     z_scores = np.abs(zscore(df))
     return np.where(z_scores > threshold)
+
 
 outlier_rows, outlier_cols = detect_outliers_zscore(df_numeric)
 print(f"\n🔹 Найдено {len(set(outlier_rows))} строк с выбросами по Z-score.")
@@ -59,3 +64,75 @@ df_cleaned = df.iloc[df_dbscan_cleaned.index, :]
 # === 8. Сохраняем обработанные данные ===
 df_cleaned.to_csv("cleaned_data.csv", index=False)
 print("\n✅ Финальные очищенные данные сохранены в 'cleaned_data.csv'.")
+
+
+# === 9. Сглаживание данных методом скользящего среднего ===
+def apply_moving_average(df, columns, window_size=3):
+    smoothed_data = df.copy()
+    for col in columns:
+        smoothed_data[col] = df[col].rolling(window=window_size, center=True).mean()
+    return smoothed_data
+
+
+# Применяем сглаживание
+df_smoothed = apply_moving_average(df_cleaned, columns_to_analyze, window_size=3)
+df_smoothed = df_smoothed.dropna()  # Удаляем строки с NaN после сглаживания
+df_smoothed.to_csv("smoothed_data.csv", index=False)
+print("\n✅ Данные сглажены методом скользящего среднего и сохранены в 'smoothed_data.csv'.")
+
+from sklearn.metrics import mean_squared_error
+
+
+def calculate_metrics(original, smoothed, column):
+    # Обрезаем оригинальные данные до длины сглаженных
+    aligned_original = original.loc[smoothed.index]
+
+    # Вычисляем MSE и RMSE
+    mse = mean_squared_error(aligned_original[column], smoothed[column])  # MSE
+    rmse = np.sqrt(mse)  # Корень из MSE для RMSE
+
+    # Снижение дисперсии
+    variance_reduction = (np.var(aligned_original[column]) - np.var(smoothed[column])) / np.var(
+        aligned_original[column]) * 100
+
+    print(f"RMSE для {column}: {rmse}")
+    print(f"Снижение дисперсии для {column}: {variance_reduction:.2f}%")
+
+
+# Убедимся, что NaN удалены перед расчетом метрик
+df_smoothed = df_smoothed.dropna()  # Удаляем строки с NaN
+calculate_metrics(df_cleaned, df_smoothed, "TP2")
+
+"""
+def calculate_metrics_with_nan(original, smoothed, column):
+    # RMSE игнорирует NaN
+    rmse = np.sqrt(np.nanmean((original[column] - smoothed[column]) ** 2))
+
+    # Снижение дисперсии
+    variance_reduction = (np.nanvar(original[column]) - np.nanvar(smoothed[column])) / np.nanvar(original[column]) * 100
+
+    print(f"RMSE для {column} (с учетом NaN): {rmse}")
+    print(f"Снижение дисперсии для {column} (с учетом NaN): {variance_reduction:.2f}%")
+
+
+# Расчет метрик без обрезки данных
+calculate_metrics_with_nan(df_cleaned, df_smoothed, "TP2")
+"""
+
+import matplotlib.pyplot as plt
+
+
+def plot_comparison(original, smoothed, column):
+    plt.figure(figsize=(12, 6))
+    plt.plot(original[column], label="Original Data", alpha=0.7)
+    plt.plot(smoothed[column], label="Smoothed Data (Moving Average)", alpha=0.9)
+    plt.title(f"Сравнение данных - {column}")
+    plt.xlabel("Index")
+    plt.ylabel(column)
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+
+# Сравнение для одного из параметров
+plot_comparison(df_cleaned, df_smoothed, "TP2")

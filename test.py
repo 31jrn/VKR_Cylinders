@@ -77,3 +77,18 @@ plt.show()
 # === 8. Сохраняем результат ===
 df.to_csv("processed_with_clusters.csv", index=False)
 print("\n✅ Данные сохранены в 'processed_with_clusters.csv'.")
+
+
+# === 9. Сглаживание данных методом скользящего среднего ===
+def apply_moving_average(df, columns, window_size=5):
+    smoothed_data = df.copy()
+    for col in columns:
+        smoothed_data[col] = df[col].rolling(window=window_size, center=True).mean()
+    return smoothed_data
+
+
+# Применяем сглаживание
+df_smoothed = apply_moving_average(df_cleaned, columns_to_analyze, window_size=5)
+df_smoothed = df_smoothed.dropna()  # Удаляем строки с NaN после сглаживания
+df_smoothed.to_csv("smoothed_data.csv", index=False)
+print("\n✅ Данные сглажены методом скользящего среднего и сохранены в 'smoothed_data.csv'.")
