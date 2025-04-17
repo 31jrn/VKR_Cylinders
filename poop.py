@@ -1,65 +1,138 @@
+# === 1. Импорт библиотек ===
 import pandas as pd
 import numpy as np
-from typing import Tuple, List
+from scipy.stats import kurtosis, zscore
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
 
+# === 2. Загрузка и подготовка данных ===
+file_path = "VKR_dataset_test.xlsx"
+df1 = pd.read_excel(file_path)
+df1.rename(columns={df1.columns[0]: "timestamp"}, inplace=True)
+df1["timestamp"] = pd.to_datetime(df1["timestamp"], format="%d.%m.%Y %H:%M:%S", errors="coerce")
+df1["Дата"] = df1["timestamp"].dt.date
+df1["Время"] = df1["timestamp"].dt.time
+df1 = df1.drop(columns=["timestamp"])
+columns_order = ["Дата", "Время"] + [col for col in df1.columns if col not in ["Дата", "Время"]]
+df1 = df1[columns_order].dropna()
+df1.to_csv("processed_data.csv", index=False)
+print("\n✅ Данные сохранены в 'processed_data.csv'")
 
-def estimate_period(x: np.ndarray, max_lag: int = 300) -> Tuple[int, List[float]]:
-    """
-    Вычисляет квазипериод T временного ряда по критерию минимума суммы квадратов ошибок.
-    """
-    errors = [(x[k:] - x[:-k]) ** 2 for k in range(2, max_lag)]
-    S = [np.sum(err) for err in errors]
-    T = np.argmin(S) + 2  # +2, т.к. индексы начинались с k=2
-    return T, S
+# === 3. Выбор переменных для анализа ===
+df = pd.read_csv("processed_data.csv")
+columns_to_analyze = [col for col in df.columns if col not in ["Дата", "Время"]]
 
 
-def load_and_prepare_timeseries(
-        path: str,
-        date_col: str = "Date",
-        time_col: str = "Time",
-        drop_cols: List[str] = None,
-        max_period_lag: int = 300,
-        period_feature_index: int = 0,
-) -> Tuple[np.ndarray, pd.Series, int]:
-    """
-    Загрузка и подготовка временного ряда из CSV:
-    - объединяет столбцы даты и времени;
-    - удаляет ненужные столбцы;
-    - возвращает матрицу признаков, временной индекс и период.
-    """
-    df = pd.read_csv(path)
+# === 4. Удаление выбросов по Z-score ===
+def remove_outliers_zscore(df, threshold=3):
+    z_scores = np.abs(zscore(df))
+    mask = (z_scores < threshold).all(axis=1)
+    return df[mask]
 
-    # Объединить дату и время
-    df["timestamp"] = pd.to_datetime(df[date_col] + " " + df[time_col])
-    df = df.sort_values(by="timestamp").reset_index(drop=True)
 
-    # Удалить лишние столбцы
-    base_cols = [date_col, time_col, "timestamp"]
-    if drop_cols:
-        base_cols.extend(drop_cols)
-    feature_df = df.drop(columns=base_cols)
+df_cleaned = remove_outliers_zscore(df[columns_to_analyze])
+print("\n✅ Данные очищены от выбросов по Z-score")
 
-    # Преобразовать в numpy
-    X = feature_df.to_numpy().T  # (n_features, n_timesteps)
+# === 5. Очистка данных с помощью DBSCAN ===
+dbscan = DBSCAN(eps=1.5, min_samples=5)
+labels = dbscan.fit_predict(df_cleaned)
+df_dbscan_cleaned = df_cleaned[labels != -1]
+print("\n✅ Шум удалён методом DBSCAN")
 
-    # Определение периода по одному признаку (по умолчанию X[0])
-    signal = X[period_feature_index]
-    period, errors = estimate_period(signal, max_period_lag)
+# === 6. Восстановление "Дата" и "Время" ===
+df_cleaned_full = df.loc[df_dbscan_cleaned.index, :]
+df_cleaned_full.to_csv("cleaned_data.csv", index=False)
+print("\n✅ Финальные очищенные данные сохранены в 'cleaned_data.csv'")
 
-    # График ошибок по разным сдвигам
-    plt.figure(figsize=(8, 4))
-    plt.plot(range(2, len(errors) + 2), errors)
-    plt.title(f"Оценка периода: минимальная ошибка при T={period}")
-    plt.xlabel("T")
-    plt.ylabel("S(T)")
-    plt.grid(True)
-    plt.tight_layout()
+
+# === 7. Сглаживание ===
+def apply_moving_average(df, columns, window_size=3):
+    smoothed_data = df.copy()
+    for col in columns:
+        smoothed_data[col] = df[col].rolling(window=window_size, center=True).mean()
+    return smoothed_data.dropna()
+
+
+df_smoothed = apply_moving_average(df_cleaned_full, columns_to_analyze)
+df_smoothed.to_csv("smoothed_data.csv", index=False)
+print("\n✅ Данные сглажены и сохранены в 'smoothed_data.csv'")
+
+
+# === 8. Оценка сглаживания ===
+def calculate_metrics(original, smoothed, column):
+    aligned_original = original.loc[smoothed.index]
+    rmse = np.sqrt(mean_squared_error(aligned_original[column], smoothed[column]))
+    variance_reduction = (np.var(aligned_original[column]) - np.var(smoothed[column])) / np.var(
+        aligned_original[column]) * 100
+    print(f"\n🔍 {column}: RMSE = {rmse:.4f}, Снижение дисперсии = {variance_reduction:.2f}%")
+
+
+for col in columns_to_analyze:
+    calculate_metrics(df_cleaned_full, df_smoothed, col)
+
+
+# === 9. Структура цилиндрической модели ===
+# (1) Определение периода
+# (2) Развёртка в цилиндрическую модель
+# (3) Метод наименьших квадратов (МНК)
+# (4) Псевдоградиентное обновление параметров
+
+def estimate_period(series, min_period=2, max_period=100):
+    errors = []
+    for p in range(min_period, max_period + 1):
+        segments = series[:len(series) // p * p].reshape(-1, p)
+        mean_segment = segments.mean(axis=0)
+        error = np.mean((segments - mean_segment) ** 2)
+        errors.append((p, error))
+    best_period, _ = min(errors, key=lambda x: x[1])
+    return best_period
+
+
+def build_cylindrical_model(series, period):
+    n = len(series)
+    num_cycles = n // period
+    return series[:num_cycles * period].reshape(num_cycles, period)
+
+
+def least_squares_fit(cyl_model):
+    X = cyl_model[:-1]
+    Y = cyl_model[1:]
+    params = np.linalg.pinv(X) @ Y
+    return params
+
+
+def pseudo_gradient_update(X, Y, alpha=0.001, iterations=100):
+    params = np.random.randn(X.shape[1], X.shape[1])
+    for _ in range(iterations):
+        grad = -2 * X.T @ (Y - X @ params) / len(X)
+        params -= alpha * grad
+    return params
+
+
+for col in columns_to_analyze:
+    print(f"🔄 Обработка признака: {col}")
+    series = df_smoothed[col].values
+    period = estimate_period(series)
+    print(f"📏 Определённый период для {col}: {period}")
+    cyl_model = build_cylindrical_model(series, period)
+    params_ls = least_squares_fit(cyl_model)
+    params_pg = pseudo_gradient_update(cyl_model[:-1], cyl_model[1:])
+    print(f"✅ Параметры признака {col} обучены методом МНК и псевдоградиентным методом")
+print("\n✅ Параметры обучены методом МНК и псевдоградиентным методом")
+
+
+def plot_comparison(original, smoothed, column):
+    plt.figure(figsize=(12, 6))
+    plt.plot(original[column], label="Original Data", alpha=0.7)
+    plt.plot(smoothed[column], label="Smoothed Data (Moving Average)", alpha=0.9)
+    plt.title(f"Сравнение данных - {column}")
+    plt.xlabel("Index")
+    plt.ylabel(column)
+    plt.legend()
+    plt.grid()
     plt.show()
 
-    return X, df["timestamp"], period
 
-
-X, timestamps, T = load_and_prepare_timeseries("smoothed_data.csv")
-print(f"Размерность массива X: {X.shape}")
-print(f"Оцененный период: {T}")
+# Сравнение для одного из параметров
+plot_comparison(df_cleaned, df_smoothed, "Motor_current")
