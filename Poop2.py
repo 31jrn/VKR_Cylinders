@@ -124,6 +124,7 @@ def build_regression(signal, T):
 
 def main():
     df = load_data("smoothed_data.csv")
+
     columns = ["TP2", "TP3", "H1", "DV_pressure", "Reservoirs", "Motor_current", "Oil_temperature"]
     selected_column = menu(columns)
     signal = df[selected_column].to_numpy()
@@ -132,6 +133,3 @@ def main():
     build_spiral(signal, T_period, selected_column)
     build_regression(signal, T_period)
 
-
-if __name__ == "__main__":
-    main()

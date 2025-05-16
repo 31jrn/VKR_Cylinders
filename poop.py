@@ -1,138 +1,185 @@
-# === 1. Импорт библиотек ===
 import pandas as pd
 import numpy as np
-from scipy.stats import kurtosis, zscore
-from sklearn.cluster import DBSCAN
-from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
-
-# === 2. Загрузка и подготовка данных ===
-file_path = "VKR_dataset_test.xlsx"
-df1 = pd.read_excel(file_path)
-df1.rename(columns={df1.columns[0]: "timestamp"}, inplace=True)
-df1["timestamp"] = pd.to_datetime(df1["timestamp"], format="%d.%m.%Y %H:%M:%S", errors="coerce")
-df1["Дата"] = df1["timestamp"].dt.date
-df1["Время"] = df1["timestamp"].dt.time
-df1 = df1.drop(columns=["timestamp"])
-columns_order = ["Дата", "Время"] + [col for col in df1.columns if col not in ["Дата", "Время"]]
-df1 = df1[columns_order].dropna()
-df1.to_csv("processed_data.csv", index=False)
-print("\n✅ Данные сохранены в 'processed_data.csv'")
-
-# === 3. Выбор переменных для анализа ===
-df = pd.read_csv("processed_data.csv")
-columns_to_analyze = [col for col in df.columns if col not in ["Дата", "Время"]]
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+from scipy.stats import zscore  # для вычисления Z-оценки
+from sklearn.cluster import DBSCAN  # кластеризация и удаление выбросов
 
 
-# === 4. Удаление выбросов по Z-score ===
-def remove_outliers_zscore(df, threshold=3):
-    z_scores = np.abs(zscore(df))
-    mask = (z_scores < threshold).all(axis=1)
-    return df[mask]
+def load_data(file_path):
+    df = pd.read_excel(file_path)
+    return df
 
 
-df_cleaned = remove_outliers_zscore(df[columns_to_analyze])
-print("\n✅ Данные очищены от выбросов по Z-score")
-
-# === 5. Очистка данных с помощью DBSCAN ===
-dbscan = DBSCAN(eps=1.5, min_samples=5)
-labels = dbscan.fit_predict(df_cleaned)
-df_dbscan_cleaned = df_cleaned[labels != -1]
-print("\n✅ Шум удалён методом DBSCAN")
-
-# === 6. Восстановление "Дата" и "Время" ===
-df_cleaned_full = df.loc[df_dbscan_cleaned.index, :]
-df_cleaned_full.to_csv("cleaned_data.csv", index=False)
-print("\n✅ Финальные очищенные данные сохранены в 'cleaned_data.csv'")
-
-
-# === 7. Сглаживание ===
-def apply_moving_average(df, columns, window_size=3):
-    smoothed_data = df.copy()
-    for col in columns:
-        smoothed_data[col] = df[col].rolling(window=window_size, center=True).mean()
-    return smoothed_data.dropna()
-
-
-df_smoothed = apply_moving_average(df_cleaned_full, columns_to_analyze)
-df_smoothed.to_csv("smoothed_data.csv", index=False)
-print("\n✅ Данные сглажены и сохранены в 'smoothed_data.csv'")
+def data_preprocessing(df, column, window=3, z_thresh=3.0):
+    # Очистка пустых строк
+    df_clean = df.dropna(subset=[column])
+    # Очистка по Z-оценке
+    z_scores = zscore(df_clean[column])
+    df_clean = df_clean[np.abs(z_scores) < z_thresh]
+    # DBSCAN
+    timestamps = np.arange(len(df_clean)).reshape(-1, 1)
+    values = df_clean[column].values.reshape(-1, 1)
+    X = np.hstack([timestamps, values])
+    db_clas = DBSCAN(eps=20, min_samples=5)
+    db_clas.fit(X)
+    labels = db_clas.labels_
+    df_clean['cluster'] = labels
+    df_clean = df_clean[labels != -1]
+    # Скользящее среднее
+    df_clean[column] = df_clean[column].rolling(window=window, center=True).mean()
+    df_clean = df_clean.dropna(subset=[column])
+    df_clean.to_excel("cleaned_data.xlsx", index=False)
+    return df_clean
 
 
-# === 8. Оценка сглаживания ===
-def calculate_metrics(original, smoothed, column):
-    aligned_original = original.loc[smoothed.index]
-    rmse = np.sqrt(mean_squared_error(aligned_original[column], smoothed[column]))
-    variance_reduction = (np.var(aligned_original[column]) - np.var(smoothed[column])) / np.var(
-        aligned_original[column]) * 100
-    print(f"\n🔍 {column}: RMSE = {rmse:.4f}, Снижение дисперсии = {variance_reduction:.2f}%")
+def menu(columns):
+    print("\nВыберите характеристику для анализа:")
+    for idx, col_name in enumerate(columns):
+        print(f"{idx}: {col_name}")
+    print(f"{len(columns)}: Выход из программы")
+
+    while True:
+        choice = input("\nВведите номер характеристики: ")
+        try:
+            selected_index = int(choice)
+            if selected_index == len(columns):
+                print("Выход из программы.")
+                exit()  # завершить программу
+            elif 0 <= selected_index < len(columns):
+                selected_column = columns[selected_index]
+                print(f"Вы выбрали {selected_column} для анализа.\n")
+                return selected_column
+            else:
+                print("Номер вне диапазона. Попробуйте снова.")
+        except ValueError:
+            print("Ошибка: введите целое число.")
 
 
-for col in columns_to_analyze:
-    calculate_metrics(df_cleaned_full, df_smoothed, col)
+def calculate_period(signal, selected_column, k_min_ratio=0.001, k_max=500):
+    k_min = int(len(signal) * k_min_ratio)
+    S = []
+    for k in range(k_min, k_max + 1):
+        shifted = signal[k:]
+        original = signal[:-k]
+        sqr_error_sum = np.sum((shifted - original) ** 2)
+        S.append(sqr_error_sum)
+    min_k = np.argmin(S) + k_min
 
-
-# === 9. Структура цилиндрической модели ===
-# (1) Определение периода
-# (2) Развёртка в цилиндрическую модель
-# (3) Метод наименьших квадратов (МНК)
-# (4) Псевдоградиентное обновление параметров
-
-def estimate_period(series, min_period=2, max_period=100):
-    errors = []
-    for p in range(min_period, max_period + 1):
-        segments = series[:len(series) // p * p].reshape(-1, p)
-        mean_segment = segments.mean(axis=0)
-        error = np.mean((segments - mean_segment) ** 2)
-        errors.append((p, error))
-    best_period, _ = min(errors, key=lambda x: x[1])
-    return best_period
-
-
-def build_cylindrical_model(series, period):
-    n = len(series)
-    num_cycles = n // period
-    return series[:num_cycles * period].reshape(num_cycles, period)
-
-
-def least_squares_fit(cyl_model):
-    X = cyl_model[:-1]
-    Y = cyl_model[1:]
-    params = np.linalg.pinv(X) @ Y
-    return params
-
-
-def pseudo_gradient_update(X, Y, alpha=0.001, iterations=100):
-    params = np.random.randn(X.shape[1], X.shape[1])
-    for _ in range(iterations):
-        grad = -2 * X.T @ (Y - X @ params) / len(X)
-        params -= alpha * grad
-    return params
-
-
-for col in columns_to_analyze:
-    print(f"🔄 Обработка признака: {col}")
-    series = df_smoothed[col].values
-    period = estimate_period(series)
-    print(f"📏 Определённый период для {col}: {period}")
-    cyl_model = build_cylindrical_model(series, period)
-    params_ls = least_squares_fit(cyl_model)
-    params_pg = pseudo_gradient_update(cyl_model[:-1], cyl_model[1:])
-    print(f"✅ Параметры признака {col} обучены методом МНК и псевдоградиентным методом")
-print("\n✅ Параметры обучены методом МНК и псевдоградиентным методом")
-
-
-def plot_comparison(original, smoothed, column):
-    plt.figure(figsize=(12, 6))
-    plt.plot(original[column], label="Original Data", alpha=0.7)
-    plt.plot(smoothed[column], label="Smoothed Data (Moving Average)", alpha=0.9)
-    plt.title(f"Сравнение данных - {column}")
-    plt.xlabel("Index")
-    plt.ylabel(column)
+    # Визуализация для пользователя
+    plt.figure(figsize=(10, 4))
+    plt.plot(np.arange(k_min, k_max + 1), S, label="Ошибка S(k)")
+    plt.xlabel("Сдвиг (k)")
+    plt.ylabel("Сумма квадратов ошибок")
+    plt.title(f"Поиск периода временного ряда {selected_column}")
+    plt.grid(True)
     plt.legend()
-    plt.grid()
+    plt.tight_layout()
+    plt.show()
+
+    # Предложить подтвердить/изменить
+    if min_k < 30:
+        print(f"Найденный период {min_k} подозрительно мал.")
+    else:
+        print(f"Автоматически найденный период: {min_k}")
+
+    choice = input("Введите период вручную или нажмите Enter для подтверждения: ")
+    if choice.strip() == "":
+        return min_k
+    else:
+        try:
+            manual_T = int(choice)
+            print(f"Выбран вручную: {manual_T}")
+            return manual_T
+        except ValueError:
+            print("Ошибка ввода. Используется автоматический период.")
+            return min_k
+
+
+def build_spiral(signal, T, selected_column, radius=1.0):
+    N = signal.shape[0]
+    t_x = np.arange(N)
+    theta = 2 * np.pi * (t_x % T) / T
+    z = t_x // T
+    x_circle = radius * np.cos(theta)
+    y_circle = radius * np.sin(theta)
+
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot(x_circle, y_circle, z, color='blue', linewidth=0.5, label="Спираль")
+    scatter = ax.scatter(x_circle, y_circle, z, c=signal, cmap='viridis', s=5, label="Значения")
+    ax.set_title(f"Цилиндрическая модель временного ряда {selected_column}")
+    ax.set_xlabel("X (cos)")
+    ax.set_ylabel("Y (sin)")
+    ax.set_zlabel("Виток (Z)")
+    ax.legend()
+    plt.colorbar(scatter, ax=ax, label="Значения сигнала")
+    plt.tight_layout()
     plt.show()
 
 
-# Сравнение для одного из параметров
-plot_comparison(df_cleaned, df_smoothed, "Motor_current")
+def data_comparison(original_data: pd.Series, cleaned_data: pd.Series, column):
+    plt.figure(figsize=(14, 6))
+    plt.plot(original_data.index, original_data.values, label="Исходные данные", alpha=0.5, color="gray")
+    plt.plot(cleaned_data.index, cleaned_data.values, label="Очищенные данные", color="blue")
+    plt.title(f"Сравнение исходных и очищенных данных {column}")
+    plt.xlabel("Индекс (время)")
+    plt.ylabel("Значение сигнала")
+    plt.legend(loc="upper left")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+def build_regression(signal, T):
+    x_train = []
+    y_train = []
+    for t in range(T, len(signal)):
+        x_prev = signal[t - 1]
+        x_circ = signal[t - T]
+        x_curr = signal[t]
+        x_train.append([x_prev, x_circ])
+        y_train.append(x_curr)
+
+    x_train = np.array(x_train)
+    y_train = np.array(y_train)
+
+    model = LinearRegression()
+    model.fit(x_train, y_train)
+    y_pred = model.predict(x_train)
+
+    print("Коэффициенты модели:", model.coef_)
+    print("Свободный член ε:", model.intercept_)
+    mse = mean_squared_error(y_train, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_train, y_pred)
+    print(f"Среднеквадратичная ошибка (RMSE) = {rmse:.5f}")
+    print(f"Коэффициент детерминации R^2 = {r2:.5f}")
+
+
+def main():
+    df = load_data("VKR_dataset_test.xlsx")
+    columns = df.select_dtypes(include=["number"]).columns.tolist()
+    selected_column = menu(columns)
+
+    df_clean = data_preprocessing(df, selected_column)
+    df.reset_index(drop=True, inplace=True)
+    df_clean.reset_index(drop=True, inplace=True)
+    period_signal = df_clean[selected_column].to_numpy()
+    signal = df[selected_column].to_numpy()
+    print(df.shape)
+    print(df_clean.shape)
+
+    # Вызов графика для сравнения обработанных и исходных данных
+    orig_series = df[selected_column]
+    clean_series = df_clean[selected_column]
+    data_comparison(orig_series, clean_series, selected_column)
+
+    T_period = calculate_period(period_signal, selected_column)
+    build_spiral(signal, T_period, selected_column)
+    build_regression(signal, T_period)
+
+
+if __name__ == "__main__":
+    main()
