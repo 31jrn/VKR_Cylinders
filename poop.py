@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from scipy.stats import zscore  # для вычисления Z-оценки
 from sklearn.cluster import DBSCAN  # кластеризация и удаление выбросов
 
@@ -156,6 +156,52 @@ def build_regression(signal, T):
     r2 = r2_score(y_train, y_pred)
     print(f"Среднеквадратичная ошибка (RMSE) = {rmse:.5f}")
     print(f"Коэффициент детерминации R^2 = {r2:.5f}")
+    return model
+
+
+def forecast(model, signal, T, steps):
+    predicted_data = []
+    buffer = signal.copy().tolist()
+
+    for step in range(steps):
+        x_prev = buffer[-1]
+        x_periodic = buffer[-T]
+        x_forecast = np.array([[x_prev, x_periodic]])
+        y_next = model.predict(x_forecast)[0]
+        buffer.append(y_next)
+        predicted_data.append(y_next)
+    return np.array(predicted_data)
+
+
+def comparison_plot(signal, predicted_data, T):
+    # График сравнения реального тренда и прогноза
+    plt.figure(figsize=(12, 6))
+    plt.plot(range(len(signal)), signal, label="Исходные данные")
+    forecast_range = range(len(signal), len(signal) + len(predicted_data))
+    plt.plot(forecast_range, predicted_data, 'r--o', label="Прогнозируемые значения", markersize=3)
+    plt.xlabel("Время (индексы)")
+    plt.ylabel("Значение сигнала")
+    plt.title("Прогноз значений на основе цилиндрической модели")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def evaluate_forecast(true_values, predicted_values):
+    mse = mean_squared_error(true_values, predicted_values)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(true_values, predicted_values)
+
+    # Предотвращение деления на ноль в MAPE
+    non_zero_indices = true_values != 0
+    mape = np.mean(np.abs(
+        true_values[non_zero_indices] - predicted_values[non_zero_indices] / true_values[non_zero_indices])) * 100
+    print("\n Метрики качества прогноза:")
+    print(f"MSE (дисперсия ошибок): {mse:.5f}")
+    print(f"RMSE (среднеквадратичная ошибка): {rmse:.5f}")
+    print(f"MAE (средний модуль отклонения): {mae:.5f}")
+    print(f"MAPE (процентная ошибка): {mape:.2f}%")
 
 
 def main():
@@ -178,7 +224,15 @@ def main():
 
     T_period = calculate_period(period_signal, selected_column)
     build_spiral(signal, T_period, selected_column)
-    build_regression(signal, T_period)
+    model = build_regression(signal, T_period)
+    original_data = signal[-(T_period + 1):]
+    steps = int(input("Введите количество прогнозируемых значений: "))
+    forecasted_data = forecast(model, original_data, T_period, steps)
+    print(f"Прогноз на следующие 20 значений", forecasted_data)
+    comparison_plot(original_data, forecasted_data, T_period)
+    true_values = signal[-steps:]
+    min_len = min(len(true_values), len(forecasted_data))
+    evaluate_forecast(true_values[:min_len], forecasted_data[:min_len])
 
 
 if __name__ == "__main__":
