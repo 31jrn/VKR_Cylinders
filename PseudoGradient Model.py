@@ -10,7 +10,8 @@ from sklearn.linear_model import LinearRegression
 
 
 def load_data(file_path):
-    return pd.read_csv(file_path, sep=';')
+    df = pd.read_csv(file_path, sep=';')
+    return df
 
 
 def menu(columns):
@@ -60,29 +61,37 @@ def plot_comparison(original, cleaned, name):
     plt.show()
 
 
-def calculate_period(signal, name, k_min_ratio=0.001, k_max=8640, interactive=True):
-    # Поиск периода по минимизации S(k) на очищенном сигнале
+def calculate_period(signal, name, k_min_ratio=0.001, k_max=8640):
     k_min = max(1, int(len(signal) * k_min_ratio))
     lags = np.arange(k_min, k_max + 1)
     S = [np.sum((signal[k:] - signal[:-k]) ** 2) for k in lags]
     idx = np.argmin(S)
     T_auto = lags[idx]
-    # Построение графика S(k)
+
+    # Отрисовка полной кривой S(k)
     plt.figure(figsize=(10, 4))
-    plt.plot(lags, S, alpha=0.3, label='S(k)')
-    delta = min(200, len(lags))
-    plt.plot(lags[idx - delta:idx + delta], np.array(S)[idx - delta:idx + delta], 'r', linewidth=2)
-    plt.axvline(T_auto, color='red', linestyle='--', label=f'Авто T={T_auto}')
-    plt.title(f'Поиск периода для {name}')
-    plt.xlabel('Сдвиг k')
-    plt.ylabel('S(k)')
+    plt.plot(lags, S, label="S(k) — сумма квадратов ошибок", color="gray", alpha=0.5)
+
+    # Отрисовка окна вокруг минимума
+    delta = min(200, len(lags) // 2)
+    start, end = max(0, idx - delta), min(len(lags), idx + delta)
+    plt.plot(lags[start:end], np.array(S)[start:end], color="red", linewidth=2, label="Окно ±δ")
+    plt.axvline(T_auto, color="blue", linestyle='--', label=f"Авто T = {T_auto}")
+    plt.title(f"Поиск периода временного ряда — {name}")
+    plt.xlabel("Сдвиг (k)")
+    plt.ylabel("S(k)")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
     plt.show()
-    if interactive:
-        v = input(f"Авто T={T_auto}. Введите вручную или Enter: ")
-        if v.isdigit(): return int(v)
+
+    # Подтверждение или ручной ввод
+    choice = input(f"Подтвердите период (Enter) или введите свой T вручную: ")
+    if choice.strip().isdigit():
+        T_manual = int(choice)
+        print(f"Выбран вручную: T = {T_manual}")
+        return T_manual
+    print(f"Используется автоматически найденный T = {T_auto}")
     return T_auto
 
 
@@ -153,7 +162,7 @@ def build_regression(signal, T):
     for t in range(T, len(signal)):
         X.append([signal[t - 1], signal[t - T]])
         y.append(signal[t])
-    X = np.array(X);
+    X = np.array(X)
     y = np.array(y)
     model = LinearRegression().fit(X, y)
     print(f"Regression coef: {model.coef_}, intercept: {model.intercept_:.5f}")
@@ -172,7 +181,7 @@ def forecast_regression(model, history, T, steps):
 
 
 if __name__ == '__main__':
-    df = load_data(file_path="VKR_dataset_test_10t.csv")
+    df = load_data(file_path="VKR_dataset_test.csv")
     cols = df.select_dtypes(include=[np.number]).columns.tolist()
     col = menu(cols)
 
@@ -181,7 +190,6 @@ if __name__ == '__main__':
     df_clean = data_preprocessing(df, col)
     clean = df_clean[col].values
     raw = df[col].dropna().values
-    data_difference = len(raw) - len(clean)
     # Сравнение до и после очистки
     plot_comparison(df[col].dropna(), df_clean[col], col)
 
@@ -192,12 +200,16 @@ if __name__ == '__main__':
 
     # 3) Рекомендуемые параметры
     mu, alpha, spike_thr, mu_spike, spike_reps = 1e-4, 1.0, None, None, 0
+    max_available = len(raw) - len(clean)
     print(f"Параметры: mu={mu}, alpha={alpha}, spike_thr={spike_thr}, repeats={spike_reps}\n")
     # ввод желаемого горизонта
-    steps = input('Шагов прогноза (рек.50): ')
-    steps = int(steps) if steps.isdigit() else 50
-    # не уйти за пределы доступных данных:
-    steps = min(steps, data_difference)
+    steps = int(input('Шагов прогноза (рек.50): ') or 50)
+    if steps > max_available:
+        print(
+            f"ВНИМАНИЕ: Вы запрашиваете {steps} шагов, но в raw-данных доступно только {max_available} для сравнения.")
+        steps = max_available
+        print(f"Шагов прогнозирования ограничено до: {steps}")
+
     s_thr = input("Порог спайка (Enter — отключить): ")
     spike_thr = float(s_thr) if s_thr else None
     m_sp = input("mu_spike (Enter — как mu_eff): ")
@@ -212,10 +224,10 @@ if __name__ == '__main__':
     print(f's={s:.5f}, r={r:.5f}, MSE_train={train_mse:.5f}\n')
     print('Прогнозирование (online-режим)...')
     preds = []
-    history = list(clean)
+    history = list(raw)
 
     # задаём пороги
-    E_thr = 3 * train_rmse  # например, вдвое больше RMSE на обучении
+    E_thr = 5 * train_rmse  # например, вдвое больше RMSE на обучении
     max_consec = 5  # сколько подряд больших ошибок терпим
 
     consec_bad = 0  # счётчик подряд «плохих» шагов
@@ -246,10 +258,9 @@ if __name__ == '__main__':
             break
 
         # 6) онлайн-апдейт параметров
-        s, r, _ = gradient_step(
-            history[-2], history[-1 - T], history[-2 - T],
-            x_real, s, r, mu, alpha, spike_thr, mu_spike, spike_repeats
-        )
+        s, r, _ = gradient_step(history[-2], history[-1 - T], history[-2 - T], x_real, s, r, mu, alpha, spike_thr,
+                                mu_spike, spike_repeats
+                                )
     else:
         switch_idx = steps  # не переключились
 
@@ -260,14 +271,47 @@ if __name__ == '__main__':
         preds_full = np.concatenate([preds_pg, preds_reg])
     else:
         preds_full = np.array(preds_pg)
+    print("=== Диагностика прогноза ===")
+    print("Requested steps:", steps)
+    print("Switch index:", switch_idx)
+    print("Length of online preds (preds_pg):", len(preds_pg))
+    print("Length of regression preds (preds_reg):", len(preds_reg))
+    print("Total preds_full:", len(preds_full))
 
-    x_hist = np.arange(len(clean))
+    # 1) Готовим ось X для исторических сырых данных, но только до конца clean:
+    x_hist = np.arange(len(clean))  # индексы от 0 до (len(clean)-1)
+    y_hist = raw[:len(clean)]  # первые len(clean) точек из raw
+
+    # 2) Готовим ось X для прогноза:
     x_fore = np.arange(len(clean), len(clean) + len(preds_full))
+    y_fore = preds_full  # здесь уже вся длина прогноза
 
+    # 3) Рисуем
     plt.figure(figsize=(10, 4))
-    plt.plot(x_hist, clean, label='Original data')
-    plt.plot(x_fore, preds_full, 'r--', label='Forecast')
+
+    # 3.1) Сырые данные на историческом участке
+    plt.plot(x_hist, y_hist,
+             label='Original data',
+             color='blue', alpha=0.4)
+
+    # 3.2) Собственно прогноз
+    plt.plot(x_fore, y_fore,
+             'r--', linewidth=1,
+             label='Forecast')
+    plt.scatter(x_fore, y_fore,
+                c='red', s=20,
+                label='Forecast points')
+
+    # 3.3) Если есть точка переключения — вертикальная линия
     if switch_idx < steps:
-        plt.axvline(x=len(clean) + switch_idx, color='gray', linestyle=':', label='Switch point')
-    plt.legend();
+        plt.axvline(x=len(clean) + switch_idx,
+                    color='gray', linestyle=':',
+                    label='Switch point')
+
+    plt.title(f'Forecast for {col}')
+    plt.xlabel('Step index')
+    plt.ylabel(col)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
     plt.show()
