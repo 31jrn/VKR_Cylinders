@@ -32,7 +32,18 @@ def menu(columns):
         print("Неверный ввод, попробуйте снова.")
 
 
-def data_preprocessing(df, column, window=3, z_thresh=3.0):
+def hampel_fltr(signal, column, k, n_sigma):
+    # Медиана в окне
+    window_median = signal.rolling(window=2 * k + 1, center=True).median()
+    abs_dev = (signal - window_median).abs()
+    med_abs_dev = abs_dev.rolling(window=2 * k + 1, center=True).median()
+    threshold = n_sigma * med_abs_dev  # Порог выбросов
+    outliers = (signal - window_median).abs > threshold
+    cleaned_signal = signal.copy()
+    cleaned_signal[outliers] = window_median[outliers]
+
+
+def full_preprocessing(df, column, window=3, z_thresh=3.0):
     # 1) Убираем NaN
     df_clean = df.dropna(subset=[column]).copy()
     # 2) Фильтрация по Z-оценке
@@ -46,6 +57,14 @@ def data_preprocessing(df, column, window=3, z_thresh=3.0):
     df_clean[column] = df_clean[column].rolling(window=window, center=True).mean()
     df_clean = df_clean.dropna(subset=[column])
     return df_clean
+
+
+def soft_preprocessing(signal, column, window=5):
+    # 1) убираем NaN
+    soft_clean_signal = signal.dropna(subset=[column]).copy()
+    # 2) Hampel-фильтр
+    soft_clean_signal = hampel_fltr(signal, column, window, n_sigma=3.0)
+    return soft_clean_signal
 
 
 def plot_comparison(original, cleaned, name):
@@ -187,7 +206,7 @@ if __name__ == '__main__':
 
     # 1) Предобработка
     print('Предобработка данных...')
-    df_clean = data_preprocessing(df, col)
+    df_clean = full_preprocessing(df, col)
     clean = df_clean[col].values
     raw = df[col].dropna().values
     # Сравнение до и после очистки

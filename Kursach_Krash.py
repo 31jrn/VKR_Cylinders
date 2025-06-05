@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot
 import mpl_toolkits.mplot3d
 import matplotlib.pyplot as plt
 from cProfile import label
@@ -140,6 +139,5 @@ if __name__ == "__main__":
     mse = mean_squared_error(y_train, y_pred)
     rmse = mse ** 0.5
     coef_determ = r2_score(y_train, y_pred)
-    print(f"Среднеквадратичная ошибка (RMSE) = {rmse}")
-    print(f"Коэффициент детерминации R^2 = {coef_determ}")
-
+    print(f"Среднеквадратичная ошибка (RMSE) = {rmse:.5f}")
+    print(f"Коэффициент детерминации R^2 = {coef_determ:.5f}")
