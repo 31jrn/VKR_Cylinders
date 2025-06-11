@@ -7,6 +7,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 import sys
 from sklearn.metrics import r2_score
 from sklearn.linear_model import LinearRegression
+from xgboost import XGBRegressor
 
 
 def load_data(file_path):
@@ -38,9 +39,11 @@ def hampel_fltr(signal, column, k, n_sigma):
     abs_dev = (signal - window_median).abs()
     med_abs_dev = abs_dev.rolling(window=2 * k + 1, center=True).median()
     threshold = n_sigma * med_abs_dev  # Порог выбросов
-    outliers = (signal - window_median).abs > threshold
+    deviations = (signal[column] - window_median[column]).abs()
+    outliers = deviations > threshold[column]
     cleaned_signal = signal.copy()
     cleaned_signal[outliers] = window_median[outliers]
+    return cleaned_signal
 
 
 def full_preprocessing(df, column, window=3, z_thresh=3.0):
@@ -60,10 +63,8 @@ def full_preprocessing(df, column, window=3, z_thresh=3.0):
 
 
 def soft_preprocessing(signal, column, window=5):
-    # 1) убираем NaN
-    soft_clean_signal = signal.dropna(subset=[column]).copy()
-    # 2) Hampel-фильтр
-    soft_clean_signal = hampel_fltr(signal, column, window, n_sigma=3.0)
+    incoming_data = signal.dropna(subset=[column]).copy()
+    soft_clean_signal = hampel_fltr(incoming_data, column, window, n_sigma=3.0)
     return soft_clean_signal
 
 
@@ -114,19 +115,129 @@ def calculate_period(signal, name, k_min_ratio=0.001, k_max=8640):
     return T_auto
 
 
+class PseudoGradientManager:
+    def __init__(self, T, mu, alpha, spike_thr, mu_spike, spike_repeats):
+        self.T = T
+        self.mu = mu
+        self.alpha = alpha
+        self.spike_thr = spike_thr
+        self.mu_spike = mu_spike
+        self.spike_repeats = spike_repeats
+        self.s = 0.5
+        self.r = 0.5
+
+    def fit(self, signal):
+        errors = []
+        for t in range(self.T + 1, len(signal)):
+            x_prev = signal[t - 1]
+            x_period = signal[t - self.T]
+            x_prev_period = signal[t - self.T - 1]
+            x_curr = signal[t]
+            self.s, self.r, err = gradient_step(x_prev, x_period, x_prev_period, x_curr, self.s, self.r, self.mu,
+                                                self.alpha, self.spike_thr, self.mu_spike, self.spike_repeats)
+            errors.append(err ** 2)
+        mean_sqr_err = sum(errors) / len(errors)
+        return mean_sqr_err
+
+    def predict(self, last_signal):
+        x_prev = last_signal[-1]
+        x_period = last_signal[-self.T]
+        x_prev_period = last_signal[-self.T - 1]
+        return self.s * x_prev + self.r * x_period - self.s * self.r * x_prev_period
+
+    def update(self, x_real, last_signal):
+        x_prev = last_signal[-2]
+        x_period = last_signal[-1 - self.T]
+        x_prev_period = last_signal[-2 - self.T]
+        self.s, self.r, _ = gradient_step(x_prev, x_period, x_prev_period, x_real, self.s, self.r, self.mu, self.alpha,
+                                          self.spike_thr, self.mu_spike, self.spike_repeats)
+
+
+class XGBManager():
+    def __init__(self, T, **xgb_params):
+        self.T = T
+        self.model = XGBRegressor()
+        self.is_trained = False
+
+    def fit(self, x, y):
+        self.model.fit(x, y)
+        self.is_trained = True
+
+    def predict(self, x_frcst):
+        if not self.is_trained:
+            raise RuntimeError("Модель XGB еще не подходит")
+
+        return self.model.predict(x_frcst)
+
+
+class ModelSwitch:
+    def __init__(self, window_size=20, thresh=2.0, quarantine=50):
+        self.window = window_size
+        self.thresh = thresh
+        self.quarantine = quarantine
+        self.errors = []  # список последних ошибок
+        self.on_backup = False  # сейчас на XGB
+        self.quarantine_left = 0  # сколько шагов ещё осталось работать
+
+    def record_error(self, err):
+        self.errors.append(abs(err))
+        if len(self.errors) > self.window:
+            self.errors.pop(0)
+
+    def should_switch_to_backup(self):
+        # Если ещё не на backup, считаем волатильность и сравниваем с thresh
+        if self.on_backup:
+            return False
+        if len(self.errors) < self.window:
+            return False
+        vol = np.std(self.errors)
+        if vol > self.thresh:
+            self.on_backup = True
+            self.quarantine_left = self.quarantine
+            return True
+        return False
+
+    def should_return_to_main(self):
+        # Если мы на backup, уменьшаем карантинный счётчик, и когда он исчерпан — обратная замена
+        if not self.on_backup:
+            return False
+        self.quarantine_left -= 1
+        if self.quarantine_left <= 0:
+            self.on_backup = False
+            return True
+        return False
+
+
 def gradient_step(x_prev, x_period, x_prev_period, x_curr, s, r, mu, alpha=1.0,
                   spike_thr=None, mu_spike=None, spike_repeats=0):
+    x_pred = s * x_prev + r * x_period - s * r * x_prev_period
+    error = x_curr - x_pred
+    mu_eff = mu * (1 + alpha * abs(error))
+
+
+def gradient_step(x_prev, x_period, x_prev_period, x_curr, s, r, mu, alpha=1.0,
+                  spike_thr=None, mu_spike=None, spike_repeats=0):
+    # --- ЗАЩИТА ОТ None ---
+    if mu is None:
+        mu = 1e-4
+    if mu_spike is None:
+        mu_spike = mu
     x_pred = s * x_prev + r * x_period - s * r * x_prev_period
     error = x_curr - x_pred
     mu_eff = mu * (1 + alpha * abs(error))
     grad_s = -error * (x_prev - r * x_prev_period)
     grad_r = -error * (x_period - s * x_prev_period)
     s_new, r_new = s - mu_eff * grad_s, r - mu_eff * grad_r
-    if spike_thr and abs(error) > spike_thr:
+    if spike_thr is not None and abs(error) > spike_thr:
         for _ in range(spike_repeats):
             s_new, r_new, _ = gradient_step(x_prev, x_period, x_prev_period, x_curr, s_new, r_new, mu_spike or mu_eff,
                                             alpha, None, None, 0)
     return s_new, r_new, error
+
+
+def features_targets(signal, history, T):
+    X = [[history[i - 1], history[i - T]] for i in range(T, len(history))]
+    y = [history[i] for i in range(T, len(history))]
 
 
 def predict_one(history, s, r, period):
@@ -160,6 +271,8 @@ def forecast_pseudogradient(signal, T, s, r, steps):
 
 
 def evaluate(true_vals, preds):
+    if len(true_vals) != len(preds):
+        raise ValueError(f"Несоответствие длин: true={len(true_vals)}, preds={len(preds)}")
     mse = mean_squared_error(true_vals, preds)
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(true_vals, preds)
@@ -200,135 +313,126 @@ def forecast_regression(model, history, T, steps):
 
 
 if __name__ == '__main__':
-    df = load_data(file_path="VKR_dataset_test.csv")
-    cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    col = menu(cols)
+    # --------------------------
+    # 1) Загрузка и предобработка
+    df = load_data("VKR_dataset_test.csv")
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    col = menu(numeric_cols)
 
-    # 1) Предобработка
     print('Предобработка данных...')
     df_clean = full_preprocessing(df, col)
     clean = df_clean[col].values
     raw = df[col].dropna().values
-    # Сравнение до и после очистки
+
     plot_comparison(df[col].dropna(), df_clean[col], col)
 
-    # 2) Поиск периода на очищенных данных
+    # --------------------------
+    # 2) Поиск периода
     print('Поиск периода...')
     T = calculate_period(clean, col, k_min_ratio=0.001, k_max=720)
-    print(f'Используем период T={T}\n')
 
-    # 3) Рекомендуемые параметры
-    mu, alpha, spike_thr, mu_spike, spike_reps = 1e-4, 1.0, None, None, 0
-    max_available = len(raw) - len(clean)
+    # --------------------------
+    # 3) Настройка параметров
+    mu, alpha = 1e-4, 1.0
+    spike_thr = None
+    mu_spike = None
+    spike_reps = 0
+
+    max_avail = len(raw) - len(clean)
     print(f"Параметры: mu={mu}, alpha={alpha}, spike_thr={spike_thr}, repeats={spike_reps}\n")
-    # ввод желаемого горизонта
+
     steps = int(input('Шагов прогноза (рек.50): ') or 50)
-    if steps > max_available:
-        print(
-            f"ВНИМАНИЕ: Вы запрашиваете {steps} шагов, но в raw-данных доступно только {max_available} для сравнения.")
-        steps = max_available
-        print(f"Шагов прогнозирования ограничено до: {steps}")
+    if steps > max_avail:
+        print(f"ВНИМАНИЕ: запрошено {steps}, а доступно только {max_avail}. Будем прогнозировать {max_avail}.")
+        steps = max_avail
 
-    s_thr = input("Порог спайка (Enter — отключить): ")
-    spike_thr = float(s_thr) if s_thr else None
-    m_sp = input("mu_spike (Enter — как mu_eff): ")
-    mu_spike = float(m_sp) if m_sp else None
-    rep = input("Число повторов при спайке (рек.0): ")
-    spike_repeats = int(rep) if rep.isdigit() else 0
+    inp = input("Порог спайка (Enter — без спайка): ")
+    spike_thr = float(inp) if inp else None
+    inp = input("mu_spike (Enter — как mu_eff): ")
+    mu_spike = float(inp) if inp else None
+    inp = input("Число повторов при спайке (рек.0): ")
+    spike_reps = int(inp) if inp.isdigit() else 0
 
-    # 4) Обучение и прогноз
+    # --------------------------
+    # 4) Инициализация менеджеров
+    pg = PseudoGradientManager(T, mu=1e-5, alpha=1.0, spike_thr=spike_thr, mu_spike=mu_spike, spike_repeats=spike_reps)
+    xgb = XGBManager(T)
+    switcher = ModelSwitch(window_size=20, thresh=2 * 0.0, quarantine=50)
+    # (thresh=2*train_rmse мы ещё не знаем — заполним позже)
+
+    # --------------------------
+    # 5) «Обучение» псевдоградиента и вычисление порога
     print('Обучение псевдоградиента...')
-    s, r, train_mse = learn_pseudogradient(clean, T, mu, alpha, spike_thr, mu_spike, spike_reps)
+    train_mse = pg.fit(clean)
     train_rmse = np.sqrt(train_mse)
-    print(f's={s:.5f}, r={r:.5f}, MSE_train={train_mse:.5f}\n')
-    print('Прогнозирование (online-режим)...')
-    preds = []
-    history = list(raw)
+    switcher.thresh = 2 * train_rmse
+    print(f"s={pg.s:.5f}, r={pg.r:.5f}, MSE_train={train_mse:.5f} (RMSE={train_rmse:.5f})\n")
 
-    # задаём пороги
-    E_thr = 5 * train_rmse  # например, вдвое больше RMSE на обучении
-    max_consec = 5  # сколько подряд больших ошибок терпим
-
-    consec_bad = 0  # счётчик подряд «плохих» шагов
-    preds_pg = []  # прогноз псевдоградиентом
+    # --------------------------
+    # 6) Онлайн-прогноз
+    history = list(clean)
+    preds_full = []
+    real_idx = len(clean)
 
     for i in range(steps):
-        # 1) прогноз
-        x_pred = predict_one(history, s, r, T)
-        preds_pg.append(x_pred)
+        # 1) прогноз из нужного менеджера
+        if switcher.on_backup:
+            # формируем единственную строку фич для XGB
+            feat = np.array([[history[-1], history[-T]]])
+            x_pred = xgb.predict(feat)[0]
+        else:
+            x_pred = pg.predict(history)
 
-        # 2) реальное
-        x_real = raw[len(clean) + i]
+        preds_full.append(x_pred)
+
+        # 2) действительное значение
+        x_real = raw[real_idx + i]
         history.append(x_real)
 
-        # 3) вычисление ошибки
-        err = abs(x_real - x_pred)
+        # 3) считаем ошибку
+        err = x_real - x_pred
+        switcher.record_error(err)
 
-        # 4) обновление счётчика
-        if err > E_thr:
-            consec_bad += 1
-        else:
-            consec_bad = 0
+        # 4) если пора прыгнуть на XGB — обучаем его и «включаем»
+        if not switcher.on_backup and switcher.should_switch_to_backup():
+            # готовим X и y из всей накопленной истории
+            X_train = []
+            y_train = []
+            for t in range(T, len(history)):
+                X_train.append([history[t - 1], history[t - T]])
+                y_train.append(history[t])
+            xgb.fit(np.array(X_train), np.array(y_train))
+            print(f"Перешли на XGB на шаге {i + 1} (волатильность {np.std(switcher.errors):.3f})")
 
-        # 5) проверка условия переключения
-        if consec_bad >= max_consec:
-            switch_idx = i + 1
-            print(f"Switching to regression at step {switch_idx} (error={err:.3f})")
-            break
+        # 5) если назад хотим вернуться — switcher сам задаст on_backup=False
+        switcher.should_return_to_main()
 
-        # 6) онлайн-апдейт параметров
-        s, r, _ = gradient_step(history[-2], history[-1 - T], history[-2 - T], x_real, s, r, mu, alpha, spike_thr,
-                                mu_spike, spike_repeats
-                                )
-    else:
-        switch_idx = steps  # не переключились
+        # 6) если мы всё ещё на псевдоградиенте — делаем автоапдейт
+        if not switcher.on_backup:
+            pg.update(x_real, history)
 
-    reg_model = build_regression(clean, T)
-    preds_reg = forecast_regression(reg_model, history, T, steps - switch_idx)
-
-    if switch_idx < steps:
-        preds_full = np.concatenate([preds_pg, preds_reg])
-    else:
-        preds_full = np.array(preds_pg)
+    # --------------------------
+    # 7) Диагностика
+    true_vals = raw[len(clean): len(clean) + len(preds_full)]
     print("=== Диагностика прогноза ===")
     print("Requested steps:", steps)
-    print("Switch index:", switch_idx)
-    print("Length of online preds (preds_pg):", len(preds_pg))
-    print("Length of regression preds (preds_reg):", len(preds_reg))
+    print("Switch to XGB happened:", switcher.on_backup is True or switcher.quarantine_left < 50)
     print("Total preds_full:", len(preds_full))
+    evaluate(true_vals, np.array(preds_full))
 
-    # 1) Готовим ось X для исторических сырых данных, но только до конца clean:
-    x_hist = np.arange(len(clean))  # индексы от 0 до (len(clean)-1)
-    y_hist = raw[:len(clean)]  # первые len(clean) точек из raw
-
-    # 2) Готовим ось X для прогноза:
-    x_fore = np.arange(len(clean), len(clean) + len(preds_full))
-    y_fore = preds_full  # здесь уже вся длина прогноза
-
-    # 3) Рисуем
-    plt.figure(figsize=(10, 4))
-
-    # 3.1) Сырые данные на историческом участке
-    plt.plot(x_hist, y_hist,
-             label='Original data',
-             color='blue', alpha=0.4)
-
-    # 3.2) Собственно прогноз
-    plt.plot(x_fore, y_fore,
-             'r--', linewidth=1,
-             label='Forecast')
-    plt.scatter(x_fore, y_fore,
-                c='red', s=20,
-                label='Forecast points')
-
-    # 3.3) Если есть точка переключения — вертикальная линия
-    if switch_idx < steps:
-        plt.axvline(x=len(clean) + switch_idx,
-                    color='gray', linestyle=':',
-                    label='Switch point')
-
-    plt.title(f'Forecast for {col}')
-    plt.xlabel('Step index')
+    # --------------------------
+    # 8) Итоговый график
+    plt.figure(figsize=(12, 4))
+    # а) исторические данные
+    plt.plot(np.arange(len(raw)), raw, label='История', color='blue')
+    # б) прогноз
+    plt.plot(np.arange(len(clean), len(clean) + len(preds_full)), preds_full, label='Прогноз', color='orange')
+    # в) реальные если хотим продолжение
+    plt.plot(np.arange(len(clean), len(clean) + len(preds_full)), true_vals,
+             label='Реальные продолжение', color='green', alpha=0.6, linestyle='--')
+    plt.axvline(len(clean), color='gray', linestyle=':')
+    plt.title(f'Прогноз {col}')
+    plt.xlabel('Шаги')
     plt.ylabel(col)
     plt.legend()
     plt.grid(True)
