@@ -8,6 +8,7 @@ import sys
 from sklearn.metrics import r2_score
 from sklearn.linear_model import LinearRegression
 from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split
 
 
 def load_data(file_path):
@@ -62,10 +63,21 @@ def full_preprocessing(df, column, window=3, z_thresh=3.0):
     return df_clean
 
 
-def soft_preprocessing(signal, column, window=5):
-    incoming_data = signal.dropna(subset=[column]).copy()
-    soft_clean_signal = hampel_fltr(incoming_data, column, window, n_sigma=3.0)
-    return soft_clean_signal
+def soft_preprocessing(signal, column, window=3, z_thresh=3.0):
+    # 1) Убираем NaN
+    df_clean = signal.dropna(subset=[column]).copy()
+    # 2) Фильтрация по Z-оценке
+    df_clean = df_clean[np.abs(zscore(df_clean[column])) < z_thresh]
+    # 3) Удаление выбросов DBSCAN
+    X = np.hstack([np.arange(len(df_clean)).reshape(-1, 1), df_clean[column].values.reshape(-1, 1)])
+    labels = DBSCAN(eps=20, min_samples=5).fit_predict(X)
+    df_clean['cluster'] = labels
+    df_clean = df_clean[df_clean['cluster'] != -1]
+    return df_clean
+
+
+# Разделение на тренировочную и тестовую выборки
+test_ratio = float(input("Введите долю тестовой выборки (напр., 0.2): "))
 
 
 def plot_comparison(original, cleaned, name):
@@ -210,13 +222,6 @@ class ModelSwitch:
 
 def gradient_step(x_prev, x_period, x_prev_period, x_curr, s, r, mu, alpha=1.0,
                   spike_thr=None, mu_spike=None, spike_repeats=0):
-    x_pred = s * x_prev + r * x_period - s * r * x_prev_period
-    error = x_curr - x_pred
-    mu_eff = mu * (1 + alpha * abs(error))
-
-
-def gradient_step(x_prev, x_period, x_prev_period, x_curr, s, r, mu, alpha=1.0,
-                  spike_thr=None, mu_spike=None, spike_repeats=0):
     # --- ЗАЩИТА ОТ None ---
     if mu is None:
         mu = 1e-4
@@ -320,10 +325,17 @@ if __name__ == '__main__':
     col = menu(numeric_cols)
 
     print('Предобработка данных...')
-    df_clean = full_preprocessing(df, col)
+    df_clean = soft_preprocessing(df, col)
     clean = df_clean[col].values
     raw = df[col].dropna().values
+    n_total = len(clean)
+    n_test = int(n_total*test_ratio)
+    train_clean = clean[:-n_test]
+    val_raw = raw[-n_test:]
+    print(f"Длина обучающей выборки: {len(train_clean)}")
+    print(f"Длина тестовой выборки: {len(val_raw)}")
 
+    #График сравнения сырых и очищенных данных
     plot_comparison(df[col].dropna(), df_clean[col], col)
 
     # --------------------------
